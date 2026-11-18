@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://gomisisistemleri-ctrl.github.io/sitemap.xml
