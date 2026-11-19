@@ -11,14 +11,26 @@ Kullanım:
 """
 import argparse
 import csv
+import hashlib
 import subprocess
+import tempfile
+import wave
 from pathlib import Path
+
+import numpy as np
 
 from PIL import Image, ImageDraw, ImageFont
 
 from olustur import KANAL, RENK, ilan_ayristir
 
-W, H, FPS = 1080, 1920, 25
+W, H, FPS = 1080, 1920, 30
+SR = 44100
+# Sakin fon müziği için akor dizileri (yarım ton, A4=440 Hz'e göre MIDI numaraları); tamamen üretilmiş, telifsiz
+DIZILER = [
+    [[48, 55, 59, 64], [45, 52, 55, 60], [41, 48, 52, 57], [43, 50, 55, 59]],   # Cmaj7 · Am7 · Fmaj7 · G
+    [[50, 57, 60, 65], [46, 53, 57, 62], [41, 48, 53, 57], [48, 55, 60, 64]],   # Dm7 · Bbmaj7 · F · C
+    [[45, 52, 57, 60], [41, 48, 53, 57], [48, 55, 60, 64], [43, 50, 55, 59]],   # Am · F · C · G
+]
 FONT_YOLLARI = {
     "kalin": ["/usr/share/fonts/opentype/inter/Inter-ExtraBold.otf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
     "orta": ["/usr/share/fonts/opentype/inter/Inter-SemiBold.otf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
@@ -134,13 +146,67 @@ def kapanis(k, ust, alt):
     return im
 
 
+def muzik(sure, tohum, yol):
+    """Sakin, telifsiz fon müziği üretir (yumuşak akor dokusu + hafif arpej), WAV olarak yazar."""
+    rng = np.random.default_rng(int(hashlib.md5(tohum.encode()).hexdigest()[:8], 16))
+    dizi = DIZILER[rng.integers(len(DIZILER))]
+    n = int(sure * SR)
+    t = np.arange(n) / SR
+    sol, sag = np.zeros(n), np.zeros(n)
+    akor_s = 4.0
+    frek = lambda m: 440.0 * 2 ** ((m - 69) / 12)
+    for i in range(int(np.ceil(sure / akor_s)) + 1):
+        bas = i * akor_s
+        notalar = dizi[i % len(dizi)]
+        a, b = int(max(0, bas - 0.6) * SR), min(n, int((bas + akor_s + 1.2) * SR))
+        if a >= n:
+            break
+        tt = t[a:b] - (bas - 0.6)
+        zarf = np.clip(tt / 1.4, 0, 1) * np.clip((akor_s + 1.8 - tt) / 1.4, 0, 1)
+        for j, m in enumerate(notalar):
+            f = frek(m)
+            ses = (np.sin(2 * np.pi * f * tt) + 0.25 * np.sin(2 * np.pi * 2 * f * tt + 0.3)
+                   + 0.5 * np.sin(2 * np.pi * f * 1.003 * tt)) * zarf * 0.12
+            pan = 0.35 + 0.3 * (j / 3)
+            sol[a:b] += ses * (1 - pan)
+            sag[a:b] += ses * pan
+        # hafif arpej (yüksek oktav, yavaş sönen notalar)
+        for k2 in range(8):
+            ba = bas + k2 * 0.5
+            m = notalar[(k2 * 2 + i) % 4] + 24
+            c, d = int(ba * SR), min(n, int((ba + 1.6) * SR))
+            if c >= n:
+                break
+            tt2 = t[c:d] - ba
+            nota = np.sin(2 * np.pi * frek(m) * tt2) * np.exp(-tt2 * 2.6) * np.clip(tt2 / 0.02, 0, 1) * 0.05
+            pan = 0.2 + 0.6 * ((k2 % 4) / 3)
+            sol[c:d] += nota * (1 - pan)
+            sag[c:d] += nota * pan
+    for gec, kat in ((0.21, 0.28), (0.37, 0.18), (0.61, 0.1)):   # yumuşak yankı
+        g = int(gec * SR)
+        sol[g:] += sol[:-g] * kat
+        sag[g:] += sag[:-g] * kat
+    karisim = np.stack([sol, sag], axis=1)
+    karisim *= np.clip(t / 1.0, 0, 1)[:, None] * np.clip((sure - t) / 1.8, 0, 1)[:, None]
+    karisim *= 0.32 / (np.abs(karisim).max() or 1)
+    with wave.open(str(yol), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes((karisim * 32767).astype("<i2").tobytes())
+
+
 def kaydet(sahneler, hedef):
-    """sahneler: [(PIL.Image | callable(t)->Image, saniye)] → mp4 (H.264 + sessiz ses, sosyal medya uyumlu)."""
+    """sahneler: [(PIL.Image | callable(t)->Image, saniye)] → yüksek kaliteli mp4 (H.264 + sakin fon müziği)."""
+    sure = sum(s for _, s in sahneler)
+    wav = Path(tempfile.mkstemp(suffix=".wav")[1])
+    muzik(sure, Path(hedef).stem, wav)
     p = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS),
-         "-i", "-", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-         "-c:a", "aac", "-b:a", "64k", str(hedef)], stdin=subprocess.PIPE)
+         "-i", "-", "-i", str(wav), "-shortest",
+         "-c:v", "libx264", "-preset", "slow", "-crf", "16", "-profile:v", "high", "-tune", "stillimage",
+         "-pix_fmt", "yuv420p", "-r", str(FPS), "-movflags", "+faststart",
+         "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), str(hedef)], stdin=subprocess.PIPE)
     for sahne, sure in sahneler:
         n = int(sure * FPS)
         sabit = None if callable(sahne) else sahne.tobytes()
@@ -148,6 +214,7 @@ def kaydet(sahneler, hedef):
             p.stdin.write(sabit if sabit else sahne(i / n).tobytes())
     p.stdin.close()
     p.wait()
+    wav.unlink(missing_ok=True)
     if p.returncode:
         raise RuntimeError(f"ffmpeg hatası: {hedef}")
 
@@ -202,7 +269,9 @@ def soru_videosu(k, r, hedef):
         (soru_karesi(cevap=True), 5),
         (kapanis(k, "Her gün yeni soru", "Telegram'da ücretsiz · çözümlü sorular, konu özetleri ve sınav takvimi"), 3.5),
     ], hedef)
-    return (f"Günün sorusu 👇 Cevabını yorumlara yaz!\n\nHer gün yeni soru ve çözümü Telegram kanalımızda: t.me/{k}\n\n"
+    return (f"🧠 Günün sorusu – cevabını yorumlara yaz!\n\n"
+            f"✅ Doğru cevap ve açıklaması, her gün yeni sorular, konu özetleri ve ücretsiz PDF'ler "
+            f"Telegram'daki \"{KANAL[k][0]}\" kanalımızda:\n👉 t.me/{k}\n\n"
             + etiketler(k, 4) + " #sınavhazırlık #gününsorusu")
 
 
@@ -230,8 +299,9 @@ def ilan_videosu(k, ilanlar, hedef, tarih):
     sahneler.append((kapanis(k, "Başvuru linkleri Telegram'da", "Her gün yeni ilan · il etiketiyle · reklamsız"), 3.5))
     kaydet(sahneler, hedef)
     iller = " ".join(dict.fromkeys("#" + i["il"] for i in ilanlar))
-    return (f"Bugünün {kucuk(KANAL[k][0].split('–')[0].strip())} 👇\n\nBaşvuru linkleri ve daha fazlası Telegram kanalımızda: t.me/{k}\n\n"
-            f"{iller} " + etiketler(k, 3) + " #işilanı #iş")
+    return (f"📍 Bugünün {kucuk(KANAL[k][0].split('–')[0].strip())}\n\n"
+            f"🔗 Başvuru linkleri, şartlar ve her gün yeni ilanlar Telegram'daki \"{KANAL[k][0]}\" kanalımızda:\n"
+            f"👉 t.me/{k}\n\n{iller} " + etiketler(k, 3) + " #işilanı #iş")
 
 
 def main():
